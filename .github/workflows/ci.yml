@@ -1,0 +1,143 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Full statement coverage of the native code. The js/wasm DialOption is
+  # build-tagged out of native builds and is instead exercised by the dedicated
+  # `wasm` end-to-end job below, so it is intentionally outside this figure.
+  COVER_MIN: "100.0"
+
+jobs:
+  # ── Native ────────────────────────────────────────────────────────────────
+  native:
+    name: native ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: test (+cover)
+        env:
+          CGO_ENABLED: "0"
+          GOWORK: "off"
+        run: |
+          set -euo pipefail
+          # The wasm e2e runs in its own job (needs Node); skip it here.
+          go test -mod=mod -timeout 600s -covermode=atomic \
+            -coverprofile=cover.out -skip TestWasmE2E ./...
+          go tool cover -func=cover.out | tail -1
+      - name: coverage gate
+        run: |
+          set -euo pipefail
+          pct=$(go tool cover -func=cover.out | awk '/^total:/ {gsub("%","",$3); print $3}')
+          echo "total coverage: ${pct}% (min ${COVER_MIN}%)"
+          awk -v p="$pct" -v m="$COVER_MIN" \
+            'BEGIN { exit (p+0 >= m+0) ? 0 : 1 }' \
+            || { echo "coverage ${pct}% below floor ${COVER_MIN}%"; exit 1; }
+
+  # ── js/wasm end-to-end ─────────────────────────────────────────────────────
+  # Compile the real js/wasm client and run it under Node against a live
+  # ListenWebSocket server, proving the browser path runs (not just compiles).
+  wasm:
+    name: wasm e2e (js/wasm + node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22" # global WebSocket + arraybuffer messages
+      - name: wasm end-to-end
+        env:
+          GOWORK: "off"
+        run: go test -mod=mod -v -run TestWasmE2E ./...
+      - name: wasm compile-check (all packages)
+        env:
+          GOWORK: "off"
+        run: GOOS=js GOARCH=wasm go build -mod=mod ./...
+
+  # ── Emulated (QEMU via binfmt) ─────────────────────────────────────────────
+  # Cross-compile a per-package test binary on the amd64 host, then run it under
+  # qemu-user inside a docker container for the target arch. Exercises the real
+  # instruction set (incl. s390x big-endian). The wasm e2e is skipped here (no
+  # Node in the target container).
+  emulated:
+    name: emulated ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: riscv64
+            image: "debian:trixie"
+            qemu_cpu: "rv64,v=true,vlen=128"
+          - arch: loong64
+            image: "ghcr.io/loong64/debian:trixie"
+            qemu_cpu: "la464"
+          - arch: ppc64le
+            image: "debian:trixie"
+            qemu_cpu: "power9"
+          - arch: s390x
+            image: "debian:trixie"
+            qemu_cpu: "qemu"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: register binfmt handlers (qemu-user)
+        run: docker run --privileged --rm tonistiigi/binfmt --install all
+
+      - name: cross-compile per-package test binaries
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          GOWORK: "off"
+        run: |
+          set -euo pipefail
+          mkdir -p _tests
+          for pkg in $(go list ./...); do
+            name=$(echo "$pkg" | tr '/.' '__')
+            echo ">> building test binary for $pkg ($GOARCH)"
+            go test -mod=mod -c -covermode=atomic -o "_tests/${name}.test" "$pkg"
+          done
+          ls -l _tests
+
+      - name: run test binaries under qemu (${{ matrix.arch }})
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          fail=0
+          for bin in _tests/*.test; do
+            echo "::group::run $(basename "$bin") on ${{ matrix.arch }}"
+            docker run --rm \
+              --platform "linux/${{ matrix.arch }}" \
+              -e QEMU_CPU="${{ matrix.qemu_cpu }}" \
+              -v "$PWD:/w" -w /w \
+              "${{ matrix.image }}" \
+              "/w/$bin" -test.v -test.timeout=600s -test.skip=TestWasmE2E \
+              || fail=1
+            echo "::endgroup::"
+          done
+          exit $fail

@@ -1,0 +1,5 @@
+/cover.out
+/cover*.out
+*.test
+/_tests/
+*.wasm

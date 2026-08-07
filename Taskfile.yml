@@ -1,0 +1,31 @@
+version: '3'
+
+env:
+  GOWORK: off
+
+tasks:
+  test:
+    desc: "Run tests (+coverage)"
+    cmds:
+      - go test -mod=mod -timeout 120s -covermode=atomic -coverprofile=cover.out ./...
+      - go tool cover -func=cover.out | tail -1
+
+  wasm-e2e:
+    desc: "Build the js/wasm client and run it under Node against a live server"
+    cmds:
+      - go test -mod=mod -v -run TestWasmE2E ./...
+
+  wasm-build:
+    desc: "Compile-check the js/wasm target"
+    cmds:
+      - GOOS=js GOARCH=wasm go build -mod=mod ./...
+
+  build:
+    desc: "Build (library — compile check only)"
+    cmds:
+      - go build -mod=mod ./...
+
+  lint:
+    desc: "Vet the package"
+    cmds:
+      - go vet -mod=mod ./...
