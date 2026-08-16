@@ -13,7 +13,7 @@ tasks:
   wasm-e2e:
     desc: "Build the js/wasm client and run it under Node against a live server"
     cmds:
-      - go test -mod=mod -v -run TestWasmE2E ./...
+      - go test -mod=mod -v -run 'TestWasm' ./...
 
   wasm-build:
     desc: "Compile-check the js/wasm target"

@@ -51,6 +51,12 @@ type ServerConfig struct {
     TLSConfig      *tls.Config // non-nil ⇒ serve wss:// (TLS)
     OriginPatterns []string    // allowed browser Origins ("*" to allow all; empty = same-origin)
     Logger         *log.Logger
+
+    // OnUpgrade runs before the upgrade: it can refuse the connection, and the
+    // value it returns is carried to every RPC on that connection (see
+    // "Per-connection HTTP context" below). Optional — nil keeps the
+    // connection exactly as it was.
+    OnUpgrade func(*http.Request) (any, error)
 }
 
 // ListenWebSocket binds addr, serves the upgrade handler, and returns a
@@ -63,6 +69,57 @@ func ListenWebSocket(addr string, cfg ServerConfig) (net.Listener, error)
 // its gRPC endpoint from one origin.
 func HandlerListener(cfg ServerConfig) (http.Handler, net.Listener)
 ```
+
+### Per-connection HTTP context
+
+A browser **cannot** set an `Authorization` header on a WebSocket — its
+credential is a cookie, and cookies live on the upgrade request, which the gRPC
+layer never sees. `OnUpgrade` is the seam between the two:
+
+```go
+h, lis := wstransport.HandlerListener(wstransport.ServerConfig{
+    OnUpgrade: func(r *http.Request) (any, error) {
+        // r carries cookies, headers, r.TLS, and whatever an http middleware
+        // already put on r.Context().
+        c, err := r.Cookie("session")
+        if err != nil {
+            return nil, &wstransport.UpgradeError{Code: http.StatusUnauthorized}
+        }
+        return sessions.Lookup(c.Value) // non-nil error ⇒ upgrade refused
+    },
+})
+gs := grpc.NewServer(grpc.Creds(wstransport.ServerCredentials()))
+```
+
+The value then reaches every RPC on that connection, as the `AuthInfo` of
+`peer.FromContext` — read it in one call:
+
+```go
+func (s *svc) Method(ctx context.Context, req *pb.Req) (*pb.Resp, error) {
+    v, ok := wstransport.FromContext(ctx) // the *Session from OnUpgrade
+    ...
+}
+```
+
+```go
+// UpgradeError refuses an upgrade with a chosen HTTP status (default 403).
+// Only Code and Message reach the client; Err is for the server's Logger.
+type UpgradeError struct { Code int; Message string; Err error }
+
+// ServerCredentials publishes the OnUpgrade value as gRPC peer AuthInfo.
+func ServerCredentials() credentials.TransportCredentials
+type AuthInfo struct{ Value any }        // AuthType() == "wstransport-upgrade"
+func FromContext(ctx context.Context) (any, bool)
+
+// ConnValue reads the value straight off an accepted conn, for callers who
+// prefer their own credentials.TransportCredentials and AuthInfo type.
+func ConnValue(c net.Conn) (any, bool)
+type ValueConn interface { net.Conn; UpgradeValue() any }
+```
+
+Native clients see a refusal as a typed `*HandshakeError` carrying the status
+(`errors.As`); browsers deliberately hide the failed handshake's status from
+page scripts, so the js/wasm dialer reports a plain socket error.
 
 ### Client
 
@@ -78,6 +135,10 @@ type ClientConfig struct {
 // wsURL (ws:// or wss://). Identical signature on native and js/wasm. Pair it
 // with insecure transport credentials — security is provided by wss.
 func DialOption(wsURL string, cfg ClientConfig) (grpc.DialOption, error)
+
+// HandshakeError reports an upgrade the server answered with a status other
+// than 101 — e.g. the 401/403 an OnUpgrade hook refuses with. Native only.
+type HandshakeError struct { StatusCode int; Status string; Err error }
 ```
 
 ## Usage
@@ -115,9 +176,11 @@ GOOS=js GOARCH=wasm go build -o app.wasm ./cmd/app
 ## Testing
 
 - **100%** statement coverage of the native code (`task test`).
-- A Node-driven end-to-end test compiles the real `js/wasm` client and runs a
-  full bidirectional stream against `ListenWebSocket` (`task wasm-e2e`) — it
-  proves the browser path *runs*, not merely that it compiles.
+- Node-driven end-to-end tests compile the real `js/wasm` client and run it
+  against a live server (`task wasm-e2e`) — they prove the browser path *runs*,
+  not merely that it compiles: a full bidirectional stream, a session cookie
+  travelling from the WebSocket handshake into a gRPC service method, and a
+  refused upgrade the browser client observes.
 - CI exercises six architectures (amd64, arm64 native; riscv64, loong64,
   ppc64le, s390x under QEMU) plus the `js/wasm` end-to-end job.
 

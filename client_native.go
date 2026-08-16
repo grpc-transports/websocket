@@ -27,8 +27,14 @@ func dialOpts(cfg ClientConfig) *websocket.DialOptions {
 
 // dialConn opens a WebSocket to wsURL and adapts it to a net.Conn.
 func dialConn(ctx context.Context, wsURL string, cfg ClientConfig) (net.Conn, error) {
-	c, _, err := websocket.Dial(ctx, wsURL, dialOpts(cfg))
+	c, resp, err := websocket.Dial(ctx, wsURL, dialOpts(cfg))
 	if err != nil {
+		// A response means the server answered the handshake and refused it —
+		// e.g. the 403 a ServerConfig.OnUpgrade hook produces. Surface the
+		// status so callers can act on it instead of parsing a message.
+		if resp != nil && resp.StatusCode != http.StatusSwitchingProtocols {
+			err = &HandshakeError{StatusCode: resp.StatusCode, Status: resp.Status, Err: err}
+		}
 		logf(cfg.Logger, "wstransport: dial %s: %v", wsURL, err)
 		return nil, err
 	}
