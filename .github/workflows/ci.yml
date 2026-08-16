@@ -39,9 +39,10 @@ jobs:
           GOWORK: "off"
         run: |
           set -euo pipefail
-          # The wasm e2e runs in its own job (needs Node); skip it here.
+          # The wasm e2e tests run in their own job (they need Node); skip
+          # them here.
           go test -mod=mod -timeout 600s -covermode=atomic \
-            -coverprofile=cover.out -skip TestWasmE2E ./...
+            -coverprofile=cover.out -skip 'Wasm' ./...
           go tool cover -func=cover.out | tail -1
       - name: coverage gate
         run: |
@@ -54,7 +55,9 @@ jobs:
 
   # ── js/wasm end-to-end ─────────────────────────────────────────────────────
   # Compile the real js/wasm client and run it under Node against a live
-  # ListenWebSocket server, proving the browser path runs (not just compiles).
+  # server, proving the browser path runs (not just compiles): a bidirectional
+  # echo stream, and the OnUpgrade value (a session cookie) reaching a service
+  # method — plus a refused upgrade the browser client observes.
   wasm:
     name: wasm e2e (js/wasm + node)
     runs-on: ubuntu-latest
@@ -69,7 +72,7 @@ jobs:
       - name: wasm end-to-end
         env:
           GOWORK: "off"
-        run: go test -mod=mod -v -run TestWasmE2E ./...
+        run: go test -mod=mod -v -run 'TestWasm' ./...
       - name: wasm compile-check (all packages)
         env:
           GOWORK: "off"
@@ -136,7 +139,7 @@ jobs:
               -e QEMU_CPU="${{ matrix.qemu_cpu }}" \
               -v "$PWD:/w" -w /w \
               "${{ matrix.image }}" \
-              "/w/$bin" -test.v -test.timeout=600s -test.skip=TestWasmE2E \
+              "/w/$bin" -test.v -test.timeout=600s -test.skip=Wasm \
               || fail=1
             echo "::endgroup::"
           done
